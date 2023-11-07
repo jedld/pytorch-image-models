@@ -25,6 +25,18 @@ from ._registry import register_model, generate_default_cfgs, register_model_dep
 __all__ = ['ResNet', 'BasicBlock', 'Bottleneck']  # model_registry will add each entrypoint fn to this
 
 
+def efficient_conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, efficient=False):
+    if efficient:
+        if groups is None:
+            groups = in_channels
+        return nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, dilation, groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, out_channels, 1, bias=bias),
+        )
+    else:
+        return nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups=groups, bias=bias)
+
+
 def get_padding(kernel_size: int, stride: int, dilation: int = 1) -> int:
     padding = ((stride - 1) + dilation * (kernel_size - 1)) // 2
     return padding
@@ -59,6 +71,7 @@ class BasicBlock(nn.Module):
             aa_layer: Optional[Type[nn.Module]] = None,
             drop_block: Optional[Type[nn.Module]] = None,
             drop_path: Optional[nn.Module] = None,
+            efficient: bool = False,
     ):
         """
         Args:
@@ -87,16 +100,16 @@ class BasicBlock(nn.Module):
         first_dilation = first_dilation or dilation
         use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
 
-        self.conv1 = nn.Conv2d(
+        self.conv1 = efficient_conv2d(
             inplanes, first_planes, kernel_size=3, stride=1 if use_aa else stride, padding=first_dilation,
-            dilation=first_dilation, bias=False)
+            dilation=first_dilation, bias=False, efficient=efficient)
         self.bn1 = norm_layer(first_planes)
         self.drop_block = drop_block() if drop_block is not None else nn.Identity()
         self.act1 = act_layer(inplace=True)
         self.aa = create_aa(aa_layer, channels=first_planes, stride=stride, enable=use_aa)
 
-        self.conv2 = nn.Conv2d(
-            first_planes, outplanes, kernel_size=3, padding=dilation, dilation=dilation, bias=False)
+        self.conv2 = efficient_conv2d(
+            first_planes, outplanes, kernel_size=3, padding=dilation, dilation=dilation, efficient=efficient, bias=False)
         self.bn2 = norm_layer(outplanes)
 
         self.se = create_attn(attn_layer, outplanes)
@@ -157,6 +170,7 @@ class Bottleneck(nn.Module):
             aa_layer: Optional[Type[nn.Module]] = None,
             drop_block: Optional[Type[nn.Module]] = None,
             drop_path: Optional[nn.Module] = None,
+            efficient: bool = False,
     ):
         """
         Args:
@@ -184,19 +198,19 @@ class Bottleneck(nn.Module):
         first_dilation = first_dilation or dilation
         use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
 
-        self.conv1 = nn.Conv2d(inplanes, first_planes, kernel_size=1, bias=False)
+        self.conv1 = efficient_conv2d(inplanes, first_planes, kernel_size=1, bias=False, efficient=False)
         self.bn1 = norm_layer(first_planes)
         self.act1 = act_layer(inplace=True)
 
-        self.conv2 = nn.Conv2d(
+        self.conv2 = efficient_conv2d(
             first_planes, width, kernel_size=3, stride=1 if use_aa else stride,
-            padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False)
+            padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False, efficient=efficient)
         self.bn2 = norm_layer(width)
         self.drop_block = drop_block() if drop_block is not None else nn.Identity()
         self.act2 = act_layer(inplace=True)
         self.aa = create_aa(aa_layer, channels=width, stride=stride, enable=use_aa)
 
-        self.conv3 = nn.Conv2d(width, outplanes, kernel_size=1, bias=False)
+        self.conv3 = efficient_conv2d(width, outplanes, kernel_size=1, bias=False, efficient=False) # Use efficient=False since using depthwise makes FLOPS higher
         self.bn3 = norm_layer(outplanes)
 
         self.se = create_attn(attn_layer, outplanes)
@@ -249,6 +263,7 @@ def downsample_conv(
         dilation: int = 1,
         first_dilation: Optional[int] = None,
         norm_layer: Optional[Type[nn.Module]] = None,
+        efficient: bool = False,
 ) -> nn.Module:
     norm_layer = norm_layer or nn.BatchNorm2d
     kernel_size = 1 if stride == 1 and dilation == 1 else kernel_size
@@ -256,8 +271,8 @@ def downsample_conv(
     p = get_padding(kernel_size, stride, first_dilation)
 
     return nn.Sequential(*[
-        nn.Conv2d(
-            in_channels, out_channels, kernel_size, stride=stride, padding=p, dilation=first_dilation, bias=False),
+        efficient_conv2d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=p, dilation=first_dilation, bias=False, efficient=efficient),
         norm_layer(out_channels)
     ])
 
@@ -269,6 +284,7 @@ def downsample_avg(
         stride: int = 1,
         dilation: int = 1,
         first_dilation: Optional[int] = None,
+        efficient: bool = True,
         norm_layer: Optional[Type[nn.Module]] = None,
 ) -> nn.Module:
     norm_layer = norm_layer or nn.BatchNorm2d
@@ -281,7 +297,7 @@ def downsample_avg(
 
     return nn.Sequential(*[
         pool,
-        nn.Conv2d(in_channels, out_channels, 1, stride=1, padding=0, bias=False),
+        efficient_conv2d(in_channels, out_channels, 1, stride=1, padding=0, bias=False, efficient=efficient),
         norm_layer(out_channels)
     ])
 
@@ -304,6 +320,7 @@ def make_blocks(
         avg_down: bool = False,
         drop_block_rate: float = 0.,
         drop_path_rate: float = 0.,
+        efficient: bool = False,
         **kwargs,
 ) -> Tuple[List[Tuple[str, nn.Module]], List[Dict[str, Any]]]:
     stages = []
@@ -331,10 +348,11 @@ def make_blocks(
                 dilation=dilation,
                 first_dilation=prev_dilation,
                 norm_layer=kwargs.get('norm_layer'),
+                efficient=efficient,
             )
             downsample = downsample_avg(**down_kwargs) if avg_down else downsample_conv(**down_kwargs)
 
-        block_kwargs = dict(reduce_first=reduce_first, dilation=dilation, drop_block=db, **kwargs)
+        block_kwargs = dict(reduce_first=reduce_first, dilation=dilation, drop_block=db, efficient=efficient, **kwargs)
         blocks = []
         for block_idx in range(num_blocks):
             downsample = downsample if block_idx == 0 else None
@@ -414,6 +432,7 @@ class ResNet(nn.Module):
             drop_path_rate: float = 0.,
             drop_block_rate: float = 0.,
             zero_init_last: bool = True,
+            efficient: bool = False,
             block_args: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -464,15 +483,15 @@ class ResNet(nn.Module):
             if 'tiered' in stem_type:
                 stem_chs = (3 * (stem_width // 4), stem_width)
             self.conv1 = nn.Sequential(*[
-                nn.Conv2d(in_chans, stem_chs[0], 3, stride=2, padding=1, bias=False),
+                efficient_conv2d(in_chans, stem_chs[0], 3, stride=2, padding=1, bias=False, efficient=efficient),
                 norm_layer(stem_chs[0]),
                 act_layer(inplace=True),
-                nn.Conv2d(stem_chs[0], stem_chs[1], 3, stride=1, padding=1, bias=False),
+                efficient_conv2d(stem_chs[0], stem_chs[1], 3, stride=1, padding=1, bias=False, efficient=efficient),
                 norm_layer(stem_chs[1]),
                 act_layer(inplace=True),
-                nn.Conv2d(stem_chs[1], inplanes, 3, stride=1, padding=1, bias=False)])
+                efficient_conv2d(stem_chs[1], inplanes, 3, stride=1, padding=1, bias=False, efficient=efficient)])
         else:
-            self.conv1 = nn.Conv2d(in_chans, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+            self.conv1 = efficient_conv2d(in_chans, inplanes, kernel_size=7, stride=2, padding=3, bias=False, efficient=efficient)
         self.bn1 = norm_layer(inplanes)
         self.act1 = act_layer(inplace=True)
         self.feature_info = [dict(num_chs=inplanes, reduction=2, module='act1')]
@@ -480,7 +499,7 @@ class ResNet(nn.Module):
         # Stem pooling. The name 'maxpool' remains for weight compatibility.
         if replace_stem_pool:
             self.maxpool = nn.Sequential(*filter(None, [
-                nn.Conv2d(inplanes, inplanes, 3, stride=1 if aa_layer else 2, padding=1, bias=False),
+                efficient_conv2d(inplanes, inplanes, 3, stride=1 if aa_layer else 2, padding=1, bias=False, efficient=efficient),
                 create_aa(aa_layer, channels=inplanes, stride=2) if aa_layer is not None else None,
                 norm_layer(inplanes),
                 act_layer(inplace=True),
@@ -514,6 +533,7 @@ class ResNet(nn.Module):
             aa_layer=aa_layer,
             drop_block_rate=drop_block_rate,
             drop_path_rate=drop_path_rate,
+            efficient=efficient,
             **block_args,
         )
         for stage in stage_modules:

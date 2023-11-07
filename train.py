@@ -39,6 +39,11 @@ from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 
 try:
+    from fvcore.nn import FlopCountAnalysis
+except ImportError:
+    has_fvcore = False
+
+try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
     from apex.parallel import convert_syncbn_model
@@ -354,6 +359,14 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
+group = parser.add_argument_group('FLOPs calculation')
+group.add_argument('--print-flops', action='store_true', default=False,
+                   help='Print FLOPs using fvcore')
+
+# Model architecture parameters
+group = parser.add_argument_group('Model architecture parameters')
+group.add_argument('--depthwise-conv', action='store_true', default=False,
+                   help='Use depthwise convolution in the model architecture')
 
 
 def _parse_args():
@@ -433,8 +446,18 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
+        efficient=args.depthwise_conv,
         **args.model_kwargs,
     )
+
+    if args.print_flops:
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            flops = FlopCountAnalysis(model.to(device), dummy_input.to(device))
+            _logger.info(f'Model FLOPs: {flops.total()}')
+            _logger.info(f"Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        return
+        
     if args.head_init_scale is not None:
         with torch.no_grad():
             model.get_classifier().weight.mul_(args.head_init_scale)
